@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
+
 import pytest
 
 from nybackup import backup, source
@@ -54,6 +56,104 @@ def test_backup_time_validation(app):
     assert store.config()["backup_time"] == "02:30"
     client.post("/settings", data={"backup_time": "23:45"})
     assert store.config()["backup_time"] == "23:45"
+
+
+def test_settings_move_earlier_queues_todays_catchup(app):
+    """01:45 NY: saving 01:30 queues today's plan at the new time, shown on the page."""
+    client = app.test_client()
+    store = app.extensions["store"]
+    service = app.extensions["service"]
+    today = service.now().astimezone(service.tz).strftime("%Y-%m-%d")
+    client.post("/clock/jump", data={"target": f"{today}T01:45"})
+    response = client.post(
+        "/settings", data={"backup_time": "01:30"}, follow_redirects=True
+    )
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "将按补跑规则执行" in body
+    row = store.get_plan(date.fromisoformat(today))
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["configured_time"] == "01:30"
+    # The pending plan on the page shows the new time.
+    assert "01:30" in body
+
+
+def test_settings_postpone_defers_todays_pending_plan(app):
+    """Postponing re-targets today's queued plan; the page shows the new time."""
+    client = app.test_client()
+    store = app.extensions["store"]
+    service = app.extensions["service"]
+    today = service.now().astimezone(service.tz).strftime("%Y-%m-%d")
+    client.post("/clock/jump", data={"target": f"{today}T01:45"})
+    client.post("/settings", data={"backup_time": "01:30"})
+    row = store.get_plan(date.fromisoformat(today))
+    assert row["status"] == "pending" and row["configured_time"] == "01:30"
+
+    response = client.post(
+        "/settings", data={"backup_time": "04:30"}, follow_redirects=True
+    )
+    body = response.get_data(as_text=True)
+    assert "今日计划将于 04:30（纽约时间）执行" in body
+    row = store.get_plan(date.fromisoformat(today))
+    assert row["status"] == "pending"
+    assert row["configured_time"] == "04:30"
+
+
+def test_settings_save_failure_is_reported_and_old_time_kept(app, monkeypatch):
+    client = app.test_client()
+    store = app.extensions["store"]
+
+    def boom(updates):
+        raise RuntimeError("状态库只读")
+
+    monkeypatch.setattr(store, "set_config", boom)
+    response = client.post(
+        "/settings", data={"backup_time": "01:30"}, follow_redirects=True
+    )
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "保存失败" in body
+    assert "状态库只读" in body
+    # Scheduling continues at the original time.
+    assert store.config()["backup_time"] == "02:30"
+
+
+def test_settings_after_completed_backup_makes_no_duplicate(app):
+    """Changing the time after today's backup ran does not redo it."""
+    client = app.test_client()
+    store = app.extensions["store"]
+    service = app.extensions["service"]
+    today = service.now().astimezone(service.tz).strftime("%Y-%m-%d")
+    client.post("/clock/jump", data={"target": f"{today}T23:59"})
+    service.tick()
+    assert store.get_plan(date.fromisoformat(today))["status"] == "complete"
+
+    response = client.post(
+        "/settings", data={"backup_time": "01:30"}, follow_redirects=True
+    )
+    body = response.get_data(as_text=True)
+    assert "今日备份已完成" in body
+    row = store.get_plan(date.fromisoformat(today))
+    assert row["status"] == "complete"
+    assert row["configured_time"] == "02:30"  # historical record untouched
+
+
+def test_settings_can_be_saved_while_backup_is_writing(app):
+    """Saving settings never blocks on an in-flight snapshot."""
+    client = app.test_client()
+    store = app.extensions["store"]
+    service = app.extensions["service"]
+    # Simulate an in-flight snapshot: the scheduler holds both locks.
+    assert service._tick_lock.acquire(blocking=False)
+    assert service._run_lock.acquire(blocking=False)
+    try:
+        response = client.post("/settings", data={"backup_time": "23:45"})
+        assert response.status_code == 302
+        assert store.config()["backup_time"] == "23:45"
+    finally:
+        service._run_lock.release()
+        service._tick_lock.release()
 
 
 def test_clock_jump_and_backup_then_download(app):

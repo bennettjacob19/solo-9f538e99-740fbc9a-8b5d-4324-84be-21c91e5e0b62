@@ -213,15 +213,46 @@ def create_app(overrides: Optional[dict] = None) -> Flask:
             flash(str(exc), "error")
             return redirect(url_for("index"))
         old = store.config().get("backup_time")
-        store.set_config({"backup_time": value})
+        try:
+            store.set_config({"backup_time": value})
+        except Exception as exc:  # noqa: BLE001 - 保存失败也要保住页面与调度
+            try:
+                store.log(
+                    "error",
+                    f"保存每日备份时刻失败（仍为 {old}）: {type(exc).__name__}: {exc}",
+                    virtual_now=service.now(),
+                    real_now=service.real_now(),
+                )
+            except Exception:  # noqa: BLE001 - 日志失败不能再掩盖原始错误
+                pass
+            flash(
+                f"保存失败，仍按原时刻 {old} 调度：{type(exc).__name__}: {exc}",
+                "error",
+            )
+            return redirect(url_for("index"))
         store.log(
             "info",
             f"每日备份时刻 {old} → {value}",
             virtual_now=service.now(),
             real_now=service.real_now(),
         )
-        flash(f"每日备份时刻已设为 {value}（纽约时间）", "success")
+        # 以演练时钟的纽约日期为准让新时刻当天生效：未开始的计划改按新时刻
+        # 等待，已到点的补入队列；正在写入或已完成的备份不受影响。
+        service.reschedule_now()
         service.wake()
+        today = service.now().astimezone(tz).date()
+        slot = slot_for(today, value, tz)
+        row = store.get_plan(today)
+        status = row["status"] if row is not None else None
+        if status == "complete":
+            note = "；今日备份已完成，新时刻自明天起执行"
+        elif status == "running":
+            note = "；正在写入的本次备份仍按原计划完成"
+        elif slot.instant <= service.now():
+            note = "；今日新时刻已到点，将按补跑规则执行"
+        else:
+            note = f"；今日计划将于 {slot.local.strftime('%H:%M')}（纽约时间）执行"
+        flash(f"每日备份时刻已设为 {value}（纽约时间）{note}", "success")
         return redirect(url_for("index"))
 
     @app.post("/clock")

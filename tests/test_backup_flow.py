@@ -396,3 +396,283 @@ def test_moving_backup_time_later_takes_effect_before_it_fires(env):
     assert plans["2026-11-21"]["status"] == "complete"
     assert plans["2026-11-21"]["configured_time"] == "04:15"
     assert plans["2026-11-21"]["due_utc"].startswith("2026-11-21T09:15")
+
+
+def test_moving_time_earlier_same_day_catches_up(env):
+    """01:45 NY: 02:30 -> 01:30 must not miss today's not-yet-run backup."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 21, 6, 45))  # 2026-11-21 01:45 EST
+    svc.tick()
+    # 02:30 has not been reached: no plan for today exists yet.
+    assert store.get_plan(date(2026, 11, 21)) is None
+
+    store.set_config({"backup_time": "01:30"})
+    svc.reschedule_now()
+    row = store.get_plan(date(2026, 11, 21))
+    assert row is not None and row["status"] == "pending"
+    assert row["configured_time"] == "01:30"
+    assert row["due_utc"].startswith("2026-11-21T06:30")  # 01:30 EST
+
+    svc.tick()
+    row = store.get_plan(date(2026, 11, 21))
+    assert row["status"] == "complete"
+    assert os.path.exists(backup.final_path(env["out"], date(2026, 11, 21)))
+
+
+def test_postponing_time_rejudges_queued_plan(env):
+    """A queued-but-not-started plan must wait for the postponed time."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 21, 7, 30))  # 02:30 EST: today's slot fires
+    # Another backup holds the run lock, so the plan is queued but not started.
+    svc._run_lock.acquire()
+    try:
+        svc.tick()
+    finally:
+        svc._run_lock.release()
+    row = store.get_plan(date(2026, 11, 21))
+    assert row["status"] == "pending" and row["configured_time"] == "02:30"
+
+    # Operator postpones 02:30 -> 04:30 before the queued plan starts.
+    store.set_config({"backup_time": "04:30"})
+    svc.reschedule_now()
+    row = store.get_plan(date(2026, 11, 21))
+    assert row["status"] == "pending"
+    assert row["configured_time"] == "04:30"
+    assert row["due_utc"].startswith("2026-11-21T09:30")  # 04:30 EST
+
+    # It must not fire at the old moment.
+    svc.tick()
+    assert store.get_plan(date(2026, 11, 21))["status"] == "pending"
+    assert not os.path.exists(backup.final_path(env["out"], date(2026, 11, 21)))
+
+    # It fires once the new moment arrives.
+    clock.set(utc(2026, 11, 21, 9, 31))  # 04:31 EST
+    svc.tick()
+    row = store.get_plan(date(2026, 11, 21))
+    assert row["status"] == "complete"
+    assert row["configured_time"] == "04:30"
+
+
+def test_running_backup_keeps_old_plan_and_retry_follows_new_time(env):
+    """An in-flight backup is not retargeted; a failure retries per the new time."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    plan_date = date(2026, 11, 21)
+    clock.set(utc(2026, 11, 21, 7, 30))  # 02:30 EST, the slot fires
+    store.begin_attempt(
+        plan_date,
+        due_utc=slot_for(plan_date, "02:30", svc.tz).instant,
+        configured_time="02:30",
+        shifted=False,
+        ambiguous=False,
+        partial_path=backup.backup_filename(plan_date) + ".partial",
+        virtual_now=utc(2026, 11, 21, 7, 30),
+        real_now=utc(2026, 11, 21, 7, 30),
+    )
+    # Operator saves a new time while the snapshot is still writing.
+    store.set_config({"backup_time": "04:30"})
+    svc.reschedule_now()
+    row = store.get_plan(plan_date)
+    assert row["status"] == "running"
+    assert row["configured_time"] == "02:30"  # in-flight plan untouched
+    assert row["due_utc"].startswith("2026-11-21T07:30")
+
+    # The attempt fails: when to retry is judged by the new time.
+    store.finish_attempt(
+        plan_date,
+        status="failed",
+        virtual_now=svc.now(),
+        real_now=svc.real_now(),
+        error="simulated failure",
+    )
+    svc.tick()
+    row = store.get_plan(plan_date)
+    assert row["status"] == "failed"
+    assert row["configured_time"] == "04:30"
+    assert row["due_utc"].startswith("2026-11-21T09:30")
+
+    # Not retried before the new moment...
+    clock.set(utc(2026, 11, 21, 8, 0))  # 03:00 EST
+    svc.tick()
+    assert store.get_plan(plan_date)["status"] == "failed"
+    # ...and retried once it arrives (plus the usual failure backoff).
+    clock.set(utc(2026, 11, 21, 9, 31))  # 04:31 EST
+    svc.tick()
+    clock.advance(seconds=10)
+    svc.tick()
+    row = store.get_plan(plan_date)
+    assert row["status"] == "complete"
+    assert row["attempts"] == 2
+
+
+def test_saved_time_drives_scheduling_after_restart(env):
+    """A queued same-day catch-up still fires after a restart."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 21, 6, 45))  # 01:45 EST
+    svc.tick()
+    store.set_config({"backup_time": "01:30"})
+    svc.reschedule_now()
+    row = store.get_plan(date(2026, 11, 21))
+    assert row is not None and row["status"] == "pending"
+    store.close()
+
+    # Restart before the queued catch-up fires: the saved time still rules.
+    store2 = Store(env["state"])
+    svc2 = Service(store2, env["src"], env["out"], tick_seconds=0.01, clock=clock)
+    try:
+        svc2.recover()
+        svc2.tick()
+        row = store2.get_plan(date(2026, 11, 21))
+        assert row["status"] == "complete"
+        assert row["configured_time"] == "01:30"
+        assert row["due_utc"].startswith("2026-11-21T06:30")
+    finally:
+        store2.close()
+
+
+def test_restart_with_saved_later_time_waits_for_it(env):
+    """After a restart the saved (later) time is what the plan waits for."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 21, 6, 45))  # 01:45 EST
+    svc.tick()
+    store.set_config({"backup_time": "04:30"})
+    svc.reschedule_now()
+    store.close()
+
+    clock.set(utc(2026, 11, 21, 8, 0))  # 03:00 EST, before the new 04:30
+    store2 = Store(env["state"])
+    svc2 = Service(store2, env["src"], env["out"], tick_seconds=0.01, clock=clock)
+    try:
+        svc2.recover()
+        svc2.tick()
+        assert store2.get_plan(date(2026, 11, 21)) is None  # nothing fired early
+        clock.set(utc(2026, 11, 21, 9, 31))  # 04:31 EST
+        svc2.tick()
+        row = store2.get_plan(date(2026, 11, 21))
+        assert row["status"] == "complete"
+        assert row["configured_time"] == "04:30"
+    finally:
+        store2.close()
+
+
+def test_settings_change_interleaved_with_running_scheduler(env):
+    """The time change lands while the background scheduler thread runs."""
+    import time
+
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 21, 6, 45))  # 2026-11-21 01:45 EST
+    svc.start()
+    try:
+        # Real ticks pass at 01:45 with the default 02:30: nothing runs.
+        time.sleep(0.2)
+        assert store.get_plan(date(2026, 11, 21)) is None
+
+        # Moving the time earlier catches up the same day, from the thread.
+        store.set_config({"backup_time": "01:30"})
+        svc.reschedule_now()
+        svc.wake()
+        row = _wait_for_status(store, date(2026, 11, 21), "complete")
+        assert row["configured_time"] == "01:30"
+        assert row["due_utc"].startswith("2026-11-21T06:30")
+    finally:
+        svc.stop()
+
+
+def test_postponed_time_waits_while_scheduler_runs(env):
+    """With the thread running, a postponed plan does not fire at the old time."""
+    import time
+
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 21, 6, 45))  # 01:45 EST
+    svc.start()
+    try:
+        time.sleep(0.2)
+        store.set_config({"backup_time": "03:30"})
+        svc.reschedule_now()
+        svc.wake()
+        # Ticks keep happening before 03:30: today's backup must not fire.
+        time.sleep(0.3)
+        assert store.get_plan(date(2026, 11, 21)) is None
+
+        clock.set(utc(2026, 11, 21, 8, 31))  # 03:31 EST
+        row = _wait_for_status(store, date(2026, 11, 21), "complete")
+        assert row["configured_time"] == "03:30"
+        assert row["due_utc"].startswith("2026-11-21T08:30")
+    finally:
+        svc.stop()
+
+
+def test_manual_run_still_works_after_postponement(env):
+    """A deferred plan can still be run manually right away."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 21, 7, 30))  # 02:30 EST
+    svc._run_lock.acquire()  # queue today's plan without starting it
+    try:
+        svc.tick()
+    finally:
+        svc._run_lock.release()
+    store.set_config({"backup_time": "04:30"})
+    svc.reschedule_now()
+    row = store.get_plan(date(2026, 11, 21))
+    assert row["status"] == "pending" and row["due_utc"].startswith("2026-11-21T09:30")
+
+    result = svc.run_plan_now(date(2026, 11, 21))
+    assert result["action"] == "complete"
+    assert store.get_plan(date(2026, 11, 21))["status"] == "complete"
+
+
+def test_time_change_on_spring_forward_day_keeps_dst_shift(env):
+    """A same-day change to a non-existent time still shifts past the gap."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 3, 8, 6, 55))  # 2026-03-08 01:55 EST, before the 02:00 gap
+    svc.tick()
+    assert store.get_plan(date(2026, 3, 8)) is None
+
+    # 02:00 does not exist on this day: it resolves to 03:00 EDT (07:00 UTC).
+    store.set_config({"backup_time": "02:00"})
+    svc.reschedule_now()
+    assert store.get_plan(date(2026, 3, 8)) is None  # shifted slot still ahead
+
+    clock.set(utc(2026, 3, 8, 7, 1))  # 03:01 EDT
+    svc.tick()
+    row = store.get_plan(date(2026, 3, 8))
+    assert row["status"] == "complete"
+    assert row["shifted"] == 1
+    assert row["configured_time"] == "02:00"
+    assert row["due_utc"].startswith("2026-03-08T07:00")
+
+
+def test_time_change_on_fall_back_day_uses_first_occurrence(env):
+    """A same-day change into the repeated hour catches up at the first pass."""
+    store, svc, clock = env["store"], env["service"], env["clock"]
+    clock.set(utc(2026, 11, 1, 5, 45))  # 2026-11-01 01:45 EDT (first pass)
+    svc.tick()
+    assert store.get_plan(date(2026, 11, 1)) is None
+
+    store.set_config({"backup_time": "01:30"})
+    svc.reschedule_now()
+    row = store.get_plan(date(2026, 11, 1))
+    assert row is not None and row["status"] == "pending"
+    assert row["ambiguous"] == 1
+    assert row["due_utc"].startswith("2026-11-01T05:30")  # first (EDT) occurrence
+
+    svc.tick()
+    assert store.get_plan(date(2026, 11, 1))["status"] == "complete"
+    # The second pass of 01:30 (EST) must not run anything again.
+    clock.set(utc(2026, 11, 1, 6, 40))
+    svc.tick()
+    assert len(store.all_plans()) == 1
+
+
+def _wait_for_status(store, plan_date, status, timeout=10.0):
+    import time
+
+    deadline = time.time() + timeout
+    row = None
+    while time.time() < deadline:
+        row = store.get_plan(plan_date)
+        if row is not None and row["status"] == status:
+            return row
+        time.sleep(0.01)
+    raise AssertionError(
+        f"plan {plan_date} did not reach {status}: {dict(row) if row else None}"
+    )

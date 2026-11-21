@@ -13,6 +13,10 @@ Rules implemented here
 * On restart, a fully written backup file is adopted as-is (same bytes, same
   mtime).  Leftover temp files are removed and the affected plan is retried
   under the catch-up rule.
+* Changing the daily time takes effect on the **same drill-clock day**: a plan
+  that has not started yet is re-targeted at the new time (it waits if the new
+  moment is still ahead, and is caught up under the usual rules if it already
+  passed), while a running or completed plan keeps its original schedule.
 
 Only one backup runs at a time; a tick is guarded and the snapshot writer is
 additionally guarded in :mod:`nybackup.backup`.
@@ -109,6 +113,21 @@ class Service:
 
     def wake(self) -> None:
         self._wake.set()
+
+    def reschedule_now(self) -> None:
+        """Re-evaluate today's plan against the saved settings.
+
+        Called right after the daily time is changed so the new setting takes
+        effect on the same drill-clock day.  Never blocks on an in-flight
+        backup: if the scheduler is mid-tick, the next tick (nudged via
+        :meth:`wake`) reconciles instead.
+        """
+        if not self._tick_lock.acquire(blocking=False):
+            return
+        try:
+            self._reconcile_today(self.now())
+        finally:
+            self._tick_lock.release()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -271,6 +290,78 @@ class Service:
                 )
         return latest
 
+    # -- same-day settings reconciliation ----------------------------------
+    def _reconcile_today(self, virtual_now: datetime) -> None:
+        """Make today's plan row follow the currently configured time.
+
+        Runs on every tick and right after the setting is saved, so changing
+        the daily time takes effect on the same drill-clock (New York) day:
+
+        * no row yet and the configured moment has already passed (e.g. the
+          time was just moved earlier) -> queue the catch-up row now; the
+          evaluation watermark only looks forward and would never see it;
+        * a row that has not started (``pending``/``failed``) -> re-target it
+          at the newly configured slot, whether that is later (it waits) or
+          earlier (already due -> caught up under the usual rules);
+        * ``running``/``complete``/``skipped`` rows are left alone: an
+          in-flight backup finishes under the old plan and a finished day is
+          never redone.
+        """
+        hhmm = self.settings()["backup_time"]
+        plan_date = virtual_now.astimezone(self.tz).date()
+        try:
+            slot = slot_for(plan_date, hhmm, self.tz)
+        except ScheduleError:
+            return
+        configured = slot.configured.strftime("%H:%M")
+        real_now = self.real_now()
+        row = self.store.get_plan(plan_date)
+        if row is None:
+            if slot.instant > virtual_now:
+                # Not yet due: materialise() creates the row when the slot
+                # enters the evaluation window.
+                return
+            self.store.upsert_plan(
+                plan_date,
+                status="pending",
+                due_utc=iso_utc(slot.instant),
+                configured_time=configured,
+                shifted=int(slot.shifted),
+                ambiguous=int(slot.ambiguous),
+                _real_now=real_now,
+            )
+            self.store.log(
+                "info",
+                f"计划 {plan_date.isoformat()} 按新时刻 {configured} 当天补入队列，"
+                "将按补跑规则执行",
+                virtual_now=virtual_now,
+                real_now=real_now,
+            )
+            return
+        if row["status"] not in ("pending", "failed"):
+            return
+        due = parse_utc(row["due_utc"])
+        if row["configured_time"] == configured and due == slot.instant:
+            # Already follows the current setting; avoid bumping updated_utc
+            # (it drives the failure retry backoff) on every tick.
+            return
+        self.store.upsert_plan(
+            plan_date,
+            due_utc=iso_utc(slot.instant),
+            configured_time=configured,
+            shifted=int(slot.shifted),
+            ambiguous=int(slot.ambiguous),
+            _real_now=real_now,
+        )
+        note = "新时刻已到点，将按补跑规则执行" if slot.instant <= virtual_now else "按新时刻等待"
+        self.store.log(
+            "info",
+            f"计划 {plan_date.isoformat()} 尚未开始，改按新时刻 {configured}"
+            f"（纽约时间）：{note}",
+            virtual_now=virtual_now,
+            real_now=real_now,
+        )
+
     # -- tick -------------------------------------------------------------
     def tick(self) -> dict:
         if not self._tick_lock.acquire(blocking=False):
@@ -303,6 +394,10 @@ class Service:
         else:
             self.materialise(last_eval, virtual_now)
             self._set_last_eval(virtual_now)
+
+        # Re-judge today's queued plan against the current setting before
+        # anything is selected, so a saved time change applies the same day.
+        self._reconcile_today(virtual_now)
 
         row = self._pick_work(virtual_now)
         if row is None:
